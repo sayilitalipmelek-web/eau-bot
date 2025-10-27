@@ -11,16 +11,15 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROUP_ID  = process.env.GROUP_ID;
 const RPC_URL   = process.env.RPC_URL;
 const CHAIN_ID  = Number(process.env.CHAIN_ID);
-const TOKEN     = process.env.TOKEN;   // EAU
-const WPEPU     = process.env.WPEPU;   // Wrapped PEPU
+const TOKEN     = process.env.TOKEN;
+const WPEPU     = process.env.WPEPU;
 const ROUTER    = process.env.ROUTER;
 
 /* ========= Telegram ========= */
 const bot = new Telegraf(BOT_TOKEN);
 
-/* ========= Provider (ethers v6) – Netzwerk explizit definieren ========= */
-const provider = new ethers.JsonRpcProvider({
-  url: RPC_URL,
+/* ========= Provider (ethers v6) – Fix für Render ========= */
+const provider = new ethers.JsonRpcProvider(RPC_URL, {
   name: "pepe-unchained",
   chainId: CHAIN_ID
 });
@@ -56,7 +55,7 @@ async function resolvePairInfo() {
 
   const pairAddr = await factory.getPair(WPEPU, TOKEN);
   if (!pairAddr || pairAddr === ethers.ZeroAddress) {
-    throw new Error("Pair WPEPU/EAU nicht gefunden – Prüfe WPEPU, TOKEN oder ob LP existiert.");
+    throw new Error("Pair WPEPU/EAU nicht gefunden – Prüfe ENV oder ob LP existiert.");
   }
 
   const pair   = new ethers.Contract(pairAddr, PAIR_ABI, provider);
@@ -71,7 +70,7 @@ async function resolvePairInfo() {
   return { pair, pairAddr, tokenIs0, decT, symT, decW, symW };
 }
 
-/* ========= Watcher für Käufe ========= */
+/* ========= Watcher ========= */
 async function startBuyWatcher() {
   const net = await provider.getNetwork();
   console.log(`✅ Verbunden: ${net.name} (chainId ${Number(net.chainId)})`);
@@ -102,11 +101,11 @@ async function startBuyWatcher() {
         let outAmt = 0n;
 
         try {
-          if (tokenIs0) { // token0 = EAU
+          if (tokenIs0) {
             isBuy = ev.amount1In > 0n && ev.amount0Out > 0n;
             inAmt = ev.amount1In;
             outAmt = ev.amount0Out;
-          } else {        // token1 = EAU
+          } else {
             isBuy = ev.amount0In > 0n && ev.amount1Out > 0n;
             inAmt = ev.amount0In;
             outAmt = ev.amount1Out;
