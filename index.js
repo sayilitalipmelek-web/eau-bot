@@ -3,7 +3,7 @@ import 'dotenv/config';
 import { Telegraf } from 'telegraf';
 import { ethers } from 'ethers';
 
-/* ========= ENV prüfen ========= */
+/* ===== ENV check ===== */
 const REQ = ["BOT_TOKEN","GROUP_ID","RPC_URL","CHAIN_ID","TOKEN","WPEPU","ROUTER"];
 for (const k of REQ) if (!process.env[k]) throw new Error(`❌ ENV fehlt: ${k}`);
 
@@ -15,16 +15,16 @@ const TOKEN     = process.env.TOKEN;
 const WPEPU     = process.env.WPEPU;
 const ROUTER    = process.env.ROUTER;
 
-/* ========= Telegram ========= */
+/* ===== Telegram ===== */
 const bot = new Telegraf(BOT_TOKEN);
 
-/* ========= Provider ========= */
+/* ===== Provider ===== */
 const provider = new ethers.JsonRpcProvider(RPC_URL, {
   name: "pepe-unchained",
   chainId: CHAIN_ID
 });
 
-/* ========= ABIs ========= */
+/* ===== ABIs ===== */
 const ROUTER_ABI  = [ "function factory() view returns (address)" ];
 const FACTORY_ABI = [ "function getPair(address tokenA,address tokenB) view returns (address)" ];
 const PAIR_ABI    = [
@@ -37,23 +37,25 @@ const ERC20_ABI   = [
   "function symbol() view returns (string)"
 ];
 
-/* ========= Helper ========= */
-async function safeSend(msg) {
+/* ===== Helpers ===== */
+async function safeSend(text) {
   try {
-    await bot.telegram.sendMessage(GROUP_ID, msg, { disable_web_page_preview: true });
+    await bot.telegram.sendMessage(GROUP_ID, text, { disable_web_page_preview: true });
   } catch (e) {
-    console.error("Telegram send error:", e.message);
+    console.error("Telegram send error:", e?.message || e);
   }
 }
 
-/* ========= Setup ========= */
+/* ===== Pair ermitteln ===== */
 async function resolvePair() {
   const router = new ethers.Contract(ROUTER, ROUTER_ABI, provider);
-  const factory = new ethers.Contract(await router.factory(), FACTORY_ABI, provider);
+  const factoryAddr = await router.factory();
+  const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
 
   const pairAddr = await factory.getPair(WPEPU, TOKEN);
-  if (!pairAddr || pairAddr === ethers.ZeroAddress)
-    throw new Error("⚠️ Pair nicht gefunden (TOKEN/WPEPU)");
+  if (!pairAddr || pairAddr === ethers.ZeroAddress) {
+    throw new Error("⚠️ Pair (WPEPU/EAU) nicht gefunden – existiert LP?");
+  }
 
   const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
   const token0 = (await pair.token0()).toLowerCase();
@@ -67,85 +69,86 @@ async function resolvePair() {
   return { pair, pairAddr, tokenIs0, decT, symT, decW, symW };
 }
 
-/* ========= Watcher ========= */
+/* ===== Watcher: nur Käufe ===== */
 async function startWatcher() {
   const net = await provider.getNetwork();
-  console.log(`✅ Verbunden mit ${net.name} (${Number(net.chainId)})`);
+  console.log(`✅ Verbunden: ${net.name} (chainId ${Number(net.chainId)})`);
 
   const { pair, pairAddr, tokenIs0, decT, symT, decW, symW } = await resolvePair();
-  await safeSend(`🟢 **Buy-Watcher aktiv**\nPair: \`${pairAddr}\``);
+  await safeSend(`🟢 **EAU Buy-Watcher aktiv**\nPair: \`${pairAddr}\``);
 
-  let lastBlock = await provider.getBlockNumber();
+  let last = await provider.getBlockNumber();
 
   setInterval(async () => {
     try {
       const current = await provider.getBlockNumber();
-      if (current <= lastBlock) return;
+      if (current <= last) return;
 
       const logs = await provider.getLogs({
         address: pairAddr,
         topics: [ethers.id("Swap(address,uint256,uint256,uint256,uint256,address)")],
-        fromBlock: lastBlock + 1,
+        fromBlock: last + 1,
         toBlock: current
       });
 
-      for (const log of logs) {
-        let ev;
-        try {
-          ev = pair.interface.parseLog(log).args;
-        } catch { continue; }
+      for (const lg of logs) {
+        // robustes Parsing
+        let args;
+        try { args = pair.interface.parseLog(lg).args; } catch { continue; }
 
-        let isBuy, inAmt, outAmt;
+        let isBuy = false, inAmt = 0n, outAmt = 0n;
         try {
           if (tokenIs0) {
-            isBuy = ev.amount1In > 0n && ev.amount0Out > 0n;
-            inAmt = ev.amount1In;
-            outAmt = ev.amount0Out;
+            // Buy: WPEPU in, TOKEN (EAU) out
+            isBuy = (args.amount1In ?? 0n) > 0n && (args.amount0Out ?? 0n) > 0n;
+            inAmt  = args.amount1In ?? 0n;
+            outAmt = args.amount0Out ?? 0n;
           } else {
-            isBuy = ev.amount0In > 0n && ev.amount1Out > 0n;
-            inAmt = ev.amount0In;
-            outAmt = ev.amount1Out;
+            isBuy = (args.amount0In ?? 0n) > 0n && (args.amount1Out ?? 0n) > 0n;
+            inAmt  = args.amount0In ?? 0n;
+            outAmt = args.amount1Out ?? 0n;
           }
         } catch { continue; }
 
         if (!isBuy) continue;
 
-        let eau = 0, wpepu = 0;
+        // Zahlen sicher formatieren
+        let eauNum, wpepuNum;
         try {
-          eau = parseFloat(ethers.formatUnits(outAmt || 0n, decT || 18));
-          wpepu = parseFloat(ethers.formatUnits(inAmt || 0n, decW || 18));
+          eauNum   = Number(ethers.formatUnits(outAmt, decT || 18));
+          wpepuNum = Number(ethers.formatUnits(inAmt,  decW || 18));
         } catch { continue; }
+        if (!Number.isFinite(eauNum) || !Number.isFinite(wpepuNum) || eauNum <= 0 || wpepuNum <= 0) continue;
 
-        if (!isFinite(eau) || !isFinite(wpepu) || eau <= 0 || wpepu <= 0) continue;
-
+        const txUrl = `https://pepuscan.com/tx/${lg.transactionHash}`;
         await safeSend(
-          `🟢 **BUY erkannt!**\n` +
-          `${eau.toFixed(4)} ${symT} für ${wpepu.toFixed(4)} ${symW}\n` +
-          `TX: \`${log.transactionHash}\``
+          `🟢 **BUY erkannt**\n` +
+          `${eauNum.toFixed(4)} ${symT} für ${wpepuNum.toFixed(4)} ${symW}\n` +
+          `🔗 ${txUrl}`
         );
       }
 
-      lastBlock = current;
-    } catch (err) {
-      console.error("Watcher error:", err.message);
+      last = current;
+    } catch (e) {
+      console.error("Watcher error:", e?.message || e);
     }
-  }, 7000);
+  }, 7000); // 7s Polling
 }
 
-/* ========= Telegram ========= */
-bot.start((ctx) => ctx.reply("EAU Cooling Bot läuft ✅ Zeigt nur Käufe."));
-bot.command("status", async (ctx) => {
-  const block = await provider.getBlockNumber().catch(() => 0);
-  ctx.reply(`📡 Chain ${CHAIN_ID}\nBlock: ${block}\nNur Käufe werden angezeigt.`);
+/* ===== Telegram Commands ===== */
+bot.start((ctx)=> ctx.reply("EAU Buy-Watcher läuft ✅ (meldet nur Käufe)."));
+bot.command('status', async (ctx)=>{
+  const b = await provider.getBlockNumber().catch(()=>0);
+  ctx.reply(`📡 Chain ${CHAIN_ID} | Block ${b}\nÜberwacht: WPEPU → EAU`);
 });
 
-/* ========= Start ========= */
+/* ===== Start ===== */
 bot.launch({ dropPendingUpdates: true })
-  .then(async () => {
-    console.log("🤖 Bot gestartet...");
-    await startWatcher().catch(async (e) => {
-      console.error("Start error:", e.message);
-      await safeSend(`⚠️ Fehler: ${e.message}`);
+  .then(async ()=>{
+    console.log("🤖 Bot gestartet…");
+    await startWatcher().catch(async e=>{
+      console.error("Startfehler:", e?.message || e);
+      await safeSend(`⚠️ Startfehler: ${e?.message || e}`);
     });
   })
-  .catch((e) => console.error("Bot launch error:", e.message));
+  .catch(e => console.error("Bot launch error:", e?.message || e));
