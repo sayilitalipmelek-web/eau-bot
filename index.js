@@ -37,28 +37,25 @@ const ERC20_ABI   = [
   "function symbol() view returns (string)"
 ];
 
-/* ========= Helpers ========= */
-async function safeSend(text) {
+/* ========= Helper ========= */
+async function safeSend(msg) {
   try {
-    await bot.telegram.sendMessage(GROUP_ID, text, { disable_web_page_preview: true });
+    await bot.telegram.sendMessage(GROUP_ID, msg, { disable_web_page_preview: true });
   } catch (e) {
-    console.error("Send error:", e?.message || e);
+    console.error("Telegram send error:", e.message);
   }
 }
 
-const router = new ethers.Contract(ROUTER, ROUTER_ABI, provider);
-
-/* ========= LP-Pair auflösen ========= */
-async function resolvePairInfo() {
-  const factoryAddr = await router.factory();
-  const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
+/* ========= Setup ========= */
+async function resolvePair() {
+  const router = new ethers.Contract(ROUTER, ROUTER_ABI, provider);
+  const factory = new ethers.Contract(await router.factory(), FACTORY_ABI, provider);
 
   const pairAddr = await factory.getPair(WPEPU, TOKEN);
-  if (!pairAddr || pairAddr === ethers.ZeroAddress) {
-    throw new Error("Pair WPEPU/EAU nicht gefunden – Prüfe ENV oder ob LP existiert.");
-  }
+  if (!pairAddr || pairAddr === ethers.ZeroAddress)
+    throw new Error("⚠️ Pair nicht gefunden (TOKEN/WPEPU)");
 
-  const pair   = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+  const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
   const token0 = (await pair.token0()).toLowerCase();
   const tokenIs0 = TOKEN.toLowerCase() === token0;
 
@@ -71,39 +68,34 @@ async function resolvePairInfo() {
 }
 
 /* ========= Watcher ========= */
-async function startBuyWatcher() {
+async function startWatcher() {
   const net = await provider.getNetwork();
-  console.log(`✅ Verbunden: ${net.name} (chainId ${Number(net.chainId)})`);
+  console.log(`✅ Verbunden mit ${net.name} (${Number(net.chainId)})`);
 
-  const { pair, pairAddr, tokenIs0, decT, symT, decW, symW } = await resolvePairInfo();
-  await safeSend(`🟢 Buy-Watcher gestartet\nPair: \`${pairAddr}\``);
+  const { pair, pairAddr, tokenIs0, decT, symT, decW, symW } = await resolvePair();
+  await safeSend(`🟢 **Buy-Watcher aktiv**\nPair: \`${pairAddr}\``);
 
-  let last = await provider.getBlockNumber();
+  let lastBlock = await provider.getBlockNumber();
 
   setInterval(async () => {
     try {
       const current = await provider.getBlockNumber();
-      if (current <= last) return;
+      if (current <= lastBlock) return;
 
       const logs = await provider.getLogs({
         address: pairAddr,
         topics: [ethers.id("Swap(address,uint256,uint256,uint256,uint256,address)")],
-        fromBlock: last + 1,
+        fromBlock: lastBlock + 1,
         toBlock: current
       });
 
-      for (const lg of logs) {
+      for (const log of logs) {
         let ev;
         try {
-          ev = pair.interface.parseLog(lg).args;
-        } catch {
-          continue;
-        }
+          ev = pair.interface.parseLog(log).args;
+        } catch { continue; }
 
-        let isBuy = false;
-        let inAmt = 0n;
-        let outAmt = 0n;
-
+        let isBuy, inAmt, outAmt;
         try {
           if (tokenIs0) {
             isBuy = ev.amount1In > 0n && ev.amount0Out > 0n;
@@ -114,56 +106,46 @@ async function startBuyWatcher() {
             inAmt = ev.amount0In;
             outAmt = ev.amount1Out;
           }
-        } catch {
-          continue;
-        }
+        } catch { continue; }
 
         if (!isBuy) continue;
 
-        let eau = 0;
-        let wpepu = 0;
+        let eau = 0, wpepu = 0;
         try {
           eau = parseFloat(ethers.formatUnits(outAmt || 0n, decT || 18));
           wpepu = parseFloat(ethers.formatUnits(inAmt || 0n, decW || 18));
-        } catch {
-          continue;
-        }
+        } catch { continue; }
 
-        // Wenn ein Wert NaN oder unplausibel ist → skippen
         if (!isFinite(eau) || !isFinite(wpepu) || eau <= 0 || wpepu <= 0) continue;
 
         await safeSend(
           `🟢 **BUY erkannt!**\n` +
           `${eau.toFixed(4)} ${symT} für ${wpepu.toFixed(4)} ${symW}\n` +
-          `TX: \`${lg.transactionHash}\``
+          `TX: \`${log.transactionHash}\``
         );
       }
 
-      last = current;
-    } catch (e) {
-      console.error("Watcher error:", e?.message || e);
+      lastBlock = current;
+    } catch (err) {
+      console.error("Watcher error:", err.message);
     }
-  }, 6000);
+  }, 7000);
 }
 
-/* ========= Telegram Commands ========= */
-bot.command('status', async (ctx) => {
-  const b = await provider.getBlockNumber().catch(() => null);
-  ctx.reply(
-    `🤖 Online | Chain ${CHAIN_ID} | ${b ? `Block ${b}` : 'kein Block'}\n` +
-    `Token: ${TOKEN}\nÜberwacht nur Käufe (WPEPU → EAU)`
-  );
+/* ========= Telegram ========= */
+bot.start((ctx) => ctx.reply("EAU Cooling Bot läuft ✅ Zeigt nur Käufe."));
+bot.command("status", async (ctx) => {
+  const block = await provider.getBlockNumber().catch(() => 0);
+  ctx.reply(`📡 Chain ${CHAIN_ID}\nBlock: ${block}\nNur Käufe werden angezeigt.`);
 });
-
-bot.start((ctx)=> ctx.reply("EAU Buy-Watcher aktiv ✅ (meldet nur Käufe aus WPEPU → EAU)."));
 
 /* ========= Start ========= */
 bot.launch({ dropPendingUpdates: true })
   .then(async () => {
-    console.log("✅ Telegram-Bot gestartet");
-    await startBuyWatcher().catch(async e => {
-      console.error("Startfehler:", e?.message || e);
-      await safeSend(`⚠️ Startfehler: ${e?.message || e}`);
+    console.log("🤖 Bot gestartet...");
+    await startWatcher().catch(async (e) => {
+      console.error("Start error:", e.message);
+      await safeSend(`⚠️ Fehler: ${e.message}`);
     });
   })
-  .catch(e => console.error("Bot launch error:", e?.message || e));
+  .catch((e) => console.error("Bot launch error:", e.message));
