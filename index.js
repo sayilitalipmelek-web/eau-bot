@@ -11,18 +11,19 @@ const BOT_TOKEN = process.env.BOT_TOKEN;
 const GROUP_ID  = process.env.GROUP_ID;
 const RPC_URL   = process.env.RPC_URL;
 const CHAIN_ID  = Number(process.env.CHAIN_ID);
-const TOKEN     = process.env.TOKEN;  // EAU
-const WPEPU     = process.env.WPEPU;
+const TOKEN     = process.env.TOKEN;   // EAU
+const WPEPU     = process.env.WPEPU;   // Wrapped PEPU
 const ROUTER    = process.env.ROUTER;
 
 /* ========= Telegram ========= */
 const bot = new Telegraf(BOT_TOKEN);
 
 /* ========= Provider (ethers v6) – Netzwerk explizit definieren ========= */
-const provider = new ethers.JsonRpcProvider(
-  RPC_URL,
-  { name: "pepe-unchained", chainId: CHAIN_ID } // <-- wichtig für PEPU
-);
+const provider = new ethers.JsonRpcProvider({
+  url: RPC_URL,
+  name: "pepe-unchained",
+  chainId: CHAIN_ID
+});
 
 /* ========= ABIs ========= */
 const ROUTER_ABI  = [ "function factory() view returns (address)" ];
@@ -39,11 +40,16 @@ const ERC20_ABI   = [
 
 /* ========= Helpers ========= */
 async function safeSend(text) {
-  try { await bot.telegram.sendMessage(GROUP_ID, text, { disable_web_page_preview: true }); }
-  catch (e) { console.error("Send error:", e?.message || e); }
+  try {
+    await bot.telegram.sendMessage(GROUP_ID, text, { disable_web_page_preview: true });
+  } catch (e) {
+    console.error("Send error:", e?.message || e);
+  }
 }
+
 const router = new ethers.Contract(ROUTER, ROUTER_ABI, provider);
 
+/* ========= LP-Pair auflösen ========= */
 async function resolvePairInfo() {
   const factoryAddr = await router.factory();
   const factory = new ethers.Contract(factoryAddr, FACTORY_ABI, provider);
@@ -65,6 +71,7 @@ async function resolvePairInfo() {
   return { pair, pairAddr, tokenIs0, decT, symT, decW, symW };
 }
 
+/* ========= Watcher für Käufe ========= */
 async function startBuyWatcher() {
   const net = await provider.getNetwork();
   console.log(`✅ Verbunden: ${net.name} (chainId ${Number(net.chainId)})`);
@@ -88,24 +95,42 @@ async function startBuyWatcher() {
 
       for (const lg of logs) {
         const ev = pair.interface.parseLog(lg).args;
+        if (!ev) continue;
 
-        // BUY = WPEPU rein, EAU raus
-        let isBuy, inAmt, outAmt;
-        if (tokenIs0) { // token0 = EAU
-          isBuy = ev.amount1In > 0n && ev.amount0Out > 0n;
-          inAmt = ev.amount1In;  outAmt = ev.amount0Out;
-        } else {        // token1 = EAU
-          isBuy = ev.amount0In > 0n && ev.amount1Out > 0n;
-          inAmt = ev.amount0In;  outAmt = ev.amount1Out;
+        let isBuy = false;
+        let inAmt = 0n;
+        let outAmt = 0n;
+
+        try {
+          if (tokenIs0) { // token0 = EAU
+            isBuy = ev.amount1In > 0n && ev.amount0Out > 0n;
+            inAmt = ev.amount1In;
+            outAmt = ev.amount0Out;
+          } else {        // token1 = EAU
+            isBuy = ev.amount0In > 0n && ev.amount1Out > 0n;
+            inAmt = ev.amount0In;
+            outAmt = ev.amount1Out;
+          }
+        } catch {
+          continue;
         }
+
         if (!isBuy) continue;
 
-        const eau   = ethers.formatUnits(outAmt, decT);
-        const wpepu = ethers.formatUnits(inAmt, decW);
+        let eau = 0;
+        let wpepu = 0;
+        try {
+          eau = parseFloat(ethers.formatUnits(outAmt, decT));
+          wpepu = parseFloat(ethers.formatUnits(inAmt, decW));
+        } catch {
+          continue;
+        }
+
+        if (isNaN(eau) || isNaN(wpepu)) continue;
 
         await safeSend(
-          `🟢 **BUY**\n` +
-          `${eau} ${symT} für ${wpepu} ${symW}\n` +
+          `🟢 **BUY erkannt!**\n` +
+          `${eau.toFixed(4)} ${symT} für ${wpepu.toFixed(4)} ${symW}\n` +
           `TX: \`${lg.transactionHash}\``
         );
       }
@@ -117,15 +142,16 @@ async function startBuyWatcher() {
   }, 5000);
 }
 
-/* ========= Bot-Kommandos (optional) ========= */
+/* ========= Telegram Commands ========= */
 bot.command('status', async (ctx) => {
   const b = await provider.getBlockNumber().catch(() => null);
   ctx.reply(
     `🤖 Online | Chain ${CHAIN_ID} | ${b ? `Block ${b}` : 'kein Block'}\n` +
-    `Token: ${TOKEN}\nPair wird überwacht (nur Käufe).`
+    `Token: ${TOKEN}\nÜberwacht nur Käufe (WPEPU → EAU)`
   );
 });
-bot.start((ctx)=> ctx.reply("EAU Buy-Watcher aktiv (nur Käufe aus WPEPU → EAU)."));
+
+bot.start((ctx)=> ctx.reply("EAU Buy-Watcher aktiv ✅ (meldet nur Käufe aus WPEPU → EAU)."));
 
 /* ========= Start ========= */
 bot.launch({ dropPendingUpdates: true })
