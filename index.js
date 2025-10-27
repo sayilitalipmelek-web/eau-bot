@@ -18,7 +18,7 @@ const ROUTER    = process.env.ROUTER;
 /* ========= Telegram ========= */
 const bot = new Telegraf(BOT_TOKEN);
 
-/* ========= Provider (ethers v6) – Fix für Render ========= */
+/* ========= Provider ========= */
 const provider = new ethers.JsonRpcProvider(RPC_URL, {
   name: "pepe-unchained",
   chainId: CHAIN_ID
@@ -93,8 +93,12 @@ async function startBuyWatcher() {
       });
 
       for (const lg of logs) {
-        const ev = pair.interface.parseLog(lg).args;
-        if (!ev) continue;
+        let ev;
+        try {
+          ev = pair.interface.parseLog(lg).args;
+        } catch {
+          continue;
+        }
 
         let isBuy = false;
         let inAmt = 0n;
@@ -119,13 +123,14 @@ async function startBuyWatcher() {
         let eau = 0;
         let wpepu = 0;
         try {
-          eau = parseFloat(ethers.formatUnits(outAmt, decT));
-          wpepu = parseFloat(ethers.formatUnits(inAmt, decW));
+          eau = parseFloat(ethers.formatUnits(outAmt || 0n, decT || 18));
+          wpepu = parseFloat(ethers.formatUnits(inAmt || 0n, decW || 18));
         } catch {
           continue;
         }
 
-        if (isNaN(eau) || isNaN(wpepu)) continue;
+        // Wenn ein Wert NaN oder unplausibel ist → skippen
+        if (!isFinite(eau) || !isFinite(wpepu) || eau <= 0 || wpepu <= 0) continue;
 
         await safeSend(
           `🟢 **BUY erkannt!**\n` +
@@ -138,7 +143,7 @@ async function startBuyWatcher() {
     } catch (e) {
       console.error("Watcher error:", e?.message || e);
     }
-  }, 5000);
+  }, 6000);
 }
 
 /* ========= Telegram Commands ========= */
